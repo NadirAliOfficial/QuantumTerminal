@@ -28,7 +28,7 @@ def _load_mt5_path() -> Optional[str]:
     """
     Read MT5 terminal path from local_config.ini.
     Falls back to None (MT5 auto-detect) if file or key is missing.
-    
+
     Expected format in local_config.ini:
         [mt5]
         terminal_path = C:/Program Files/MetaTrader 5/terminal64.exe
