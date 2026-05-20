@@ -1,0 +1,51 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.egg-info/
+*.egg
+dist/
+*.whl
+
+# === Virtual Environments ===
+.env
+.venv
+env/
+venv/
+ENV/
+
+# === IDE / Editors ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === Node.js ===
+node_modules/
+
+# === Build Artifacts ===
+build/
+*.spec
+
+# === OS Files ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === Logs & Databases ===
+*.log
+*.sqlite3
+*.db
+logs/
+
+# === Local Config (generated at runtime) ===
+consumer_config.ini
+cache/
+
+# === Data Library (local market data — large files) ===
+data_library/
+
+# === Test Caches ===
+.pytest_cache/

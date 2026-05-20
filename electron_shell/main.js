@@ -1,0 +1,698 @@
+// version: v9
+// v9 — F-24 (Security wave 2): three new IPC handlers for encrypted
+//      credential storage via Electron safeStorage. Replaces the
+//      consumer-side plaintext password in localStorage (the audit's
+//      F-24 vulnerability). safeStorage uses the OS keychain — DPAPI on
+//      Windows, Keychain on macOS, libsecret on Linux. Encrypted blob
+//      written to `app.getPath('userData')/mk_credentials.json` (same
+//      Electron userData dir as session storage). LoginScreen.jsx v50
+//      consumes these via window.mkElectron.secureSavePassword/
+//      secureLoadPassword/secureClearPassword and runs a one-time
+//      migration that reads any legacy localStorage.mk_saved_pass,
+//      encrypts it, then deletes the plaintext. Bus thread:
+//      security-audit-2026-05-09 + terminal_server_vps msg #166.
+// v8 — Ctrl+= / Ctrl+- / Ctrl+0 zoom shortcuts + external-URL routing
+//      (2026-05-08). Two operator-requested changes:
+//       (1) Restored browser-style font zoom that v1 had natively (browser
+//           mode). Wired via webContents.setZoomLevel; Ctrl+0 resets to
+//           100%. Range clamped to [-8, +9] (V8's safe zone). Applied to
+//           BOTH the main window and detached windows. Existing F12 dev-
+//           tools toggle stays dev-only; zoom is always-on.
+//       (2) Added setWindowOpenHandler to BrowserWindows so window.open()
+//           calls and <a target="_blank"> clicks route to the OS default
+//           browser via shell.openExternal instead of spawning an embedded
+//           Electron child window. Specific motivator: the "OPEN FREE
+//           DEMO ACCOUNT" button in SettingsPanel was opening Tickmill
+//           inside a stripped-down Electron sub-window.
+// v7 — Drop the /S NSIS silent flag from the installer spawn. Electron-
+//      builder's oneClick:true installer is already near-silent (small
+//      progress window only) AND its .onInstSuccess auto-launches the
+//      new exe. The /S flag put NSIS into truly-silent mode which
+//      ALSO suppressed the auto-launch hook — so the update finished
+//      with no terminal running, requiring the user to click the
+//      shortcut. With /S dropped, oneClick handles both: silent UX
+//      (small NSIS progress only) + auto-relaunch.
+// v6 — Silent NSIS install. The installer is now spawned with /S and
+//      windowsHide: true so no NSIS GUI flashes during update. Combined
+//      with oneClick:true in electron-builder NSIS config, the installer
+//      runs silently and auto-launches the new exe on completion.
+// v5 — IPC: mk:download-and-install. Replaces the old "open download URL
+//      in a new window" flow which spawned a blank Electron child window
+//      and then chained Chromium's download dialog. Now the URL is fetched
+//      directly via https/http (with redirects), streamed to %TEMP%, the
+//      installer is spawned detached, and the running terminal quits so
+//      NSIS can replace the install dir without "in use" conflicts.
+// Quantum Terminal Consumer — Electron main process
+// =============================================================================
+// Approach: minimal-risk, maximum-reuse.
+//
+//   1. Spawn the existing Python backend (PyInstaller-built data_server.exe in
+//      production, or `python data_server.py` from venv_consumer in dev) as a
+//      hidden child process — `windowsHide: true` so the user sees no console.
+//
+//   2. Wait for /api/health to come up.
+//
+//   3. Open a single BrowserWindow pointing at http://127.0.0.1:8502/ — same
+//      URL the browser opens today. All React fetch('/api/...') calls resolve
+//      relative to that host, no frontend code changes required.
+//
+//   4. On window close: kill the backend child cleanly so no zombie process.
+//
+// This is intentionally a thin shell. The whole React/LWC/data pipeline is
+// untouched — same code as production. If this proves stable, follow-ups can
+// switch the renderer to load from a local file:// build for full offline /
+// no-localhost-port operation.
+
+const { app, BrowserWindow, dialog, Menu, ipcMain, shell, safeStorage } = require("electron"); // v9: safeStorage for F-24 credential encryption
+const { spawn } = require("child_process");
+const path = require("path");
+const fs   = require("fs");
+const http = require("http");
+const https = require("https");
+const os    = require("os");
+const { URL } = require("url");
+
+// v2 uses port 8503 (v1 uses 8502) so both can run simultaneously without
+// conflict. Explicitly passed to the backend via --port so server_config
+// defaults can't override.
+const BACKEND_PORT = 8503;
+const BACKEND_URL  = `http://127.0.0.1:${BACKEND_PORT}`;
+const HEALTH_URL   = `${BACKEND_URL}/api/health`;
+const READY_TIMEOUT_MS = 60_000;   // give the backend up to 60s to come up
+const HEALTH_POLL_MS   = 500;
+
+let backendProc = null;
+let mainWindow  = null;
+let isQuitting  = false;
+
+// Registry of detached child windows (right-click "Open in New Window" → page).
+// `parent: mainWindow` causes Electron to auto-close these when main closes,
+// so we just need to track membership for cleanup + future broadcast features.
+const detachedWindows = new Set();
+
+// Allowlist must match the renderer's VALID_PAGES in useDetachedMode.js.
+const VALID_DETACHED_PAGES = new Set(["quant", "fundamental", "flow", "options", "stress", "learn"]);
+
+// ── 1. Locate the backend ─────────────────────────────────────────────────
+//   Production (after `npm run dist`):
+//     extraResources copies `source code/backend/` to `<resourcesDir>/backend/`
+//     PyInstaller exe is expected at `<resourcesDir>/backend/dist/data_server/data_server.exe`
+//     Falling back to `<resourcesDir>/backend/data_server.exe` if the user
+//     copied the PyInstaller output one level up.
+//   Development (`npm start` or `npm run start:dev`):
+//     Look for venv_consumer + data_server.py beside the project tree.
+function findBackendCommand() {
+  const isDev = !app.isPackaged;
+  const projectRoot = isDev
+    ? path.resolve(__dirname, "..")             // v2/ folder
+    : process.resourcesPath;                    // electron resources/ in installed app
+
+  const candidates = [];
+
+  // Spawn launcher.py — it imports data_server.app, mounts the React build
+  // at /, and runs uvicorn. Spawning data_server.py directly only serves
+  // /api/* and 404s on the root URL.
+  // Port + no-browser are env vars (MK_PORT, MK_NO_BROWSER), set in startBackend().
+
+  // Production: prebuilt PyInstaller exe inside extraResources
+  if (!isDev) {
+    candidates.push({
+      cmd:  path.join(projectRoot, "backend", "dist", "data_server", "data_server.exe"),
+      args: [],
+      cwd:  path.join(projectRoot, "backend", "dist", "data_server"),
+      label: "packaged: extraResources/backend/dist/data_server/",
+    });
+    candidates.push({
+      cmd:  path.join(projectRoot, "backend", "data_server.exe"),
+      args: [],
+      cwd:  path.join(projectRoot, "backend"),
+      label: "packaged: extraResources/backend/",
+    });
+  }
+
+  // Dev: run launcher.py via v2's own venv. Independent of v1 — no fallbacks.
+  if (isDev) {
+    const v2Venv     = path.join(projectRoot, "source code", "venv_consumer", "Scripts", "python.exe");
+    const launcherPy = path.join(projectRoot, "source code", "backend", "launcher.py");
+    if (fs.existsSync(v2Venv) && fs.existsSync(launcherPy)) {
+      candidates.push({
+        cmd: v2Venv, args: [launcherPy],
+        cwd: path.dirname(launcherPy),
+        label: "dev: v2 venv + launcher.py",
+      });
+    }
+    // System python only if v2 venv isn't built yet — useful for the
+    // "I cloned the repo, haven't run the venv setup" first-run case.
+    if (fs.existsSync(launcherPy)) {
+      candidates.push({
+        cmd: "python", args: [launcherPy],
+        cwd: path.dirname(launcherPy),
+        label: "dev: system python (no venv detected, may fail without deps installed)",
+      });
+    }
+  }
+
+  for (const c of candidates) {
+    if (c.cmd === "python" || (c.cmd && fs.existsSync(c.cmd))) {
+      console.log(`[electron] backend: ${c.label}`);
+      return c;
+    }
+  }
+  return null;
+}
+
+// ── 2. Spawn backend ──────────────────────────────────────────────────────
+function startBackend() {
+  const target = findBackendCommand();
+  if (!target) {
+    dialog.showErrorBox(
+      "Backend not found",
+      "Could not locate the Python backend. Expected a PyInstaller-built data_server.exe inside extraResources/backend/, or a dev venv_consumer with data_server.py."
+    );
+    app.exit(1);
+    return;
+  }
+
+  console.log(`[electron] spawning: ${target.cmd} ${target.args.join(" ")}`);
+  backendProc = spawn(target.cmd, target.args, {
+    cwd: target.cwd,
+    windowsHide: true,
+    detached: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      PYTHONUNBUFFERED: "1",
+      MK_PORT: String(BACKEND_PORT),       // launcher.py reads this
+      MK_NO_BROWSER: "1",                  // skip auto-launch of system browser
+      MK_APP_DIR_NAME: "QuantumTerminal-v2",      // isolate AppData from v1 (auth, cache, account state)
+    },
+  });
+
+  backendProc.stdout.on("data", (d) => console.log(`[backend] ${d.toString().trimEnd()}`));
+  backendProc.stderr.on("data", (d) => console.error(`[backend ERR] ${d.toString().trimEnd()}`));
+  backendProc.on("exit", (code, signal) => {
+    console.log(`[electron] backend exited code=${code} signal=${signal}`);
+    if (!isQuitting) {
+      // Backend died unexpectedly — close the window to make it visible.
+      if (mainWindow) mainWindow.close();
+    }
+  });
+  backendProc.on("error", (err) => {
+    console.error("[electron] backend spawn error:", err);
+    dialog.showErrorBox("Backend spawn failed", String(err));
+  });
+}
+
+// ── 3. Poll /api/health ───────────────────────────────────────────────────
+function waitForBackend() {
+  return new Promise((resolve, reject) => {
+    const startTs = Date.now();
+    const tick = () => {
+      const req = http.get(HEALTH_URL, (res) => {
+        if (res.statusCode === 200) return resolve();
+        retry();
+      });
+      req.on("error", retry);
+      req.setTimeout(2000, () => { req.destroy(); retry(); });
+    };
+    const retry = () => {
+      if (Date.now() - startTs > READY_TIMEOUT_MS) return reject(new Error("backend health check timed out"));
+      setTimeout(tick, HEALTH_POLL_MS);
+    };
+    tick();
+  });
+}
+
+// ── 4. Create the window ──────────────────────────────────────────────────
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width:  1600,
+    height: 1000,
+    minWidth:  1024,
+    minHeight: 720,
+    icon: path.join(app.isPackaged ? process.resourcesPath : __dirname, "..", "icon.ico"),
+    backgroundColor: "#000000",
+    show: false,
+    autoHideMenuBar: true,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration:  false,
+      preload: path.join(__dirname, "preload.js"),
+      // Allow the renderer to talk to http://127.0.0.1:8502 — no mixed-content
+      // headache because Electron's default security model already permits
+      // localhost http when the page itself is loaded over http.
+    },
+  });
+
+  // Strip the default File/Edit/View menu — keeps the chrome looking like an app.
+  // Comment this out if you want devtools/menu access during testing.
+  Menu.setApplicationMenu(null);
+
+  mainWindow.loadURL(BACKEND_URL);
+  mainWindow.once("ready-to-show", () => mainWindow.show());
+  mainWindow.on("closed", () => { mainWindow = null; });
+
+  // v8: route window.open() and target=_blank links to OS default browser
+  //     instead of spawning an embedded Electron sub-window.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//.test(url)) {
+      shell.openExternal(url).catch(err =>
+        console.error("[electron] shell.openExternal failed:", err));
+    }
+    return { action: "deny" };
+  });
+
+  // v8: keyboard shortcuts. Ctrl+= / Ctrl+- / Ctrl+0 zoom (always on);
+  //     F12 devtools (dev mode only). Single listener so we don't
+  //     register two before-input-event handlers on the same wc.
+  mainWindow.webContents.on("before-input-event", (event, input) => {
+    if (input.type !== "keyDown") return;
+    // F12 dev tools — gated to dev / unpackaged builds.
+    if (input.key === "F12" &&
+        (process.env.ELECTRON_DEV === "1" || !app.isPackaged)) {
+      mainWindow.webContents.toggleDevTools();
+      return;
+    }
+    // Ctrl+= / Ctrl+- / Ctrl+0 zoom — always on, production included.
+    if (input.control || input.meta) {
+      const wc = mainWindow.webContents;
+      if (input.key === "=" || input.key === "+") {
+        wc.setZoomLevel(Math.min(wc.getZoomLevel() + 0.5, 9));
+        event.preventDefault();
+      } else if (input.key === "-") {
+        wc.setZoomLevel(Math.max(wc.getZoomLevel() - 0.5, -8));
+        event.preventDefault();
+      } else if (input.key === "0") {
+        wc.setZoomLevel(0);
+        event.preventDefault();
+      }
+    }
+  });
+}
+
+// ── 5. Lifecycle ──────────────────────────────────────────────────────────
+app.whenReady().then(async () => {
+  startBackend();
+  try {
+    await waitForBackend();
+    console.log("[electron] backend healthy — opening window");
+    createWindow();
+  } catch (e) {
+    console.error("[electron] giving up:", e);
+    dialog.showErrorBox("Backend failed to start", String(e));
+    app.exit(1);
+  }
+});
+
+app.on("window-all-closed", () => {
+  isQuitting = true;
+  app.quit();
+});
+
+app.on("before-quit", () => {
+  isQuitting = true;
+  if (backendProc && !backendProc.killed) {
+    try { backendProc.kill("SIGTERM"); } catch {}
+    setTimeout(() => {
+      if (backendProc && !backendProc.killed) { try { backendProc.kill("SIGKILL"); } catch {} }
+    }, 3000);
+  }
+});
+
+// ── IPC: secure credential storage (F-24, v9) ──────────────────────────
+// safeStorage encrypts via OS keychain (DPAPI on Windows, Keychain on
+// macOS, libsecret on Linux). Encrypted blob stored at:
+//   path.join(app.getPath('userData'), 'mk_credentials.json')
+// File shape: { email: <plain>, passwordEncryptedB64: <base64 of encrypted Buffer> }
+// Email kept plain (not sensitive — visible on screen during entry).
+// Password encrypted at rest. LoginScreen.jsx v50 calls these via
+// window.mkElectron.secureSavePassword/secureLoadPassword/secureClearPassword.
+
+function _credsFilePath() {
+  return path.join(app.getPath("userData"), "mk_credentials.json");
+}
+
+ipcMain.handle("mk:secure-save-password", async (_event, { email, password }) => {
+  try {
+    if (!safeStorage.isEncryptionAvailable()) {
+      return { ok: false, error: "encryption_unavailable" };
+    }
+    if (typeof password !== "string" || password.length === 0) {
+      return { ok: false, error: "empty_password" };
+    }
+    const encrypted = safeStorage.encryptString(password);
+    const payload = {
+      email: typeof email === "string" ? email : "",
+      passwordEncryptedB64: encrypted.toString("base64"),
+      savedAt: new Date().toISOString(),
+    };
+    await fs.promises.writeFile(_credsFilePath(), JSON.stringify(payload), "utf8");
+    return { ok: true };
+  } catch (e) {
+    console.error("[electron] secure-save-password failed:", e);
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
+ipcMain.handle("mk:secure-load-password", async () => {
+  try {
+    const file = _credsFilePath();
+    if (!fs.existsSync(file)) return { ok: true, email: "", password: "" };
+    if (!safeStorage.isEncryptionAvailable()) {
+      return { ok: false, error: "encryption_unavailable" };
+    }
+    const raw = await fs.promises.readFile(file, "utf8");
+    const data = JSON.parse(raw);
+    if (!data?.passwordEncryptedB64) {
+      return { ok: true, email: data?.email || "", password: "" };
+    }
+    const encrypted = Buffer.from(data.passwordEncryptedB64, "base64");
+    const password = safeStorage.decryptString(encrypted);
+    return { ok: true, email: data.email || "", password };
+  } catch (e) {
+    console.error("[electron] secure-load-password failed:", e);
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
+ipcMain.handle("mk:secure-clear-password", async () => {
+  try {
+    const file = _credsFilePath();
+    if (fs.existsSync(file)) await fs.promises.unlink(file);
+    return { ok: true };
+  } catch (e) {
+    console.error("[electron] secure-clear-password failed:", e);
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
+// ── IPC: save screenshot via native dialog ─────────────────────────────
+// Renderer sends raw PNG bytes; main pops a native dialog + writes the file.
+// Bypasses Chromium's download manager → instant dialog, no base64 hop.
+ipcMain.handle("mk:save-screenshot", async (_event, { suggestedName, bytes }) => {
+  try {
+    const win = BrowserWindow.fromWebContents(_event.sender) || mainWindow;
+    const { canceled, filePath } = await dialog.showSaveDialog(win, {
+      title: "Save chart screenshot",
+      defaultPath: suggestedName || "chart.png",
+      filters: [{ name: "PNG image", extensions: ["png"] }],
+    });
+    if (canceled || !filePath) return { saved: false };
+    // bytes arrives as Uint8Array (preload wraps ArrayBuffer). Buffer.from
+    // accepts Uint8Array and writes raw bytes — no base64 conversion.
+    await fs.promises.writeFile(filePath, Buffer.from(bytes));
+    return { saved: true, path: filePath };
+  } catch (e) {
+    console.error("[electron] save-screenshot failed:", e);
+    return { saved: false, error: String(e) };
+  }
+});
+
+// ── IPC: fetch Trump-related news from Google News RSS ───────────────
+// Renderer's `fetch` can't reach news.google.com (no CORS). Main process
+// fetches the RSS, parses items with regex (no XML lib dep), caches for
+// 5 minutes so repeated toast-opens don't spam the upstream.
+let trumpNewsCache = { items: null, fetchedAt: 0 };
+const TRUMP_CACHE_MS = 5 * 60 * 1000;
+
+function decodeHtml(s) {
+  return String(s || "")
+    .replace(/&amp;/g,  "&")
+    .replace(/&lt;/g,   "<")
+    .replace(/&gt;/g,   ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g,  "'")
+    .replace(/&apos;/g, "'");
+}
+function parseRssItems(xml) {
+  const items = [];
+  const itemRe = /<item>([\s\S]*?)<\/item>/g;
+  let m;
+  while ((m = itemRe.exec(xml)) !== null) {
+    const block = m[1];
+    const titleMatch   = block.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/);
+    const linkMatch    = block.match(/<link>([\s\S]*?)<\/link>/);
+    const dateMatch    = block.match(/<pubDate>([\s\S]*?)<\/pubDate>/);
+    const sourceMatch  = block.match(/<source[^>]*>([\s\S]*?)<\/source>/);
+    items.push({
+      title:   decodeHtml((titleMatch  ? titleMatch[1]  : "").trim()),
+      link:    (linkMatch  ? linkMatch[1]  : "").trim(),
+      pubDate: (dateMatch  ? dateMatch[1]  : "").trim(),
+      source:  decodeHtml((sourceMatch ? sourceMatch[1] : "").trim()),
+    });
+  }
+  return items;
+}
+
+ipcMain.handle("mk:fetch-trump-news", async (_event, opts) => {
+  const force = opts && opts.force;
+  const now = Date.now();
+  if (!force && trumpNewsCache.items && now - trumpNewsCache.fetchedAt < TRUMP_CACHE_MS) {
+    return {
+      ok: true, items: trumpNewsCache.items,
+      fetchedAt: trumpNewsCache.fetchedAt, cached: true,
+    };
+  }
+  try {
+    const url = "https://news.google.com/rss/search?q=Trump&hl=en-US&gl=US&ceid=US:en";
+    const res = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 Quantum Terminal Consumer Terminal" },
+    });
+    if (!res.ok) {
+      return { ok: false, error: `HTTP ${res.status} from Google News` };
+    }
+    const xml = await res.text();
+    // v4: sort by pubDate descending (latest first) BEFORE slicing so we
+    //     never drop fresher items just because Google's RSS shipped them
+    //     out of order. Items without a parseable date sink to the bottom.
+    const all = parseRssItems(xml);
+    all.sort((a, b) => {
+      const ta = new Date(a.pubDate).getTime();
+      const tb = new Date(b.pubDate).getTime();
+      const sa = isNaN(ta) ? -Infinity : ta;
+      const sb = isNaN(tb) ? -Infinity : tb;
+      return sb - sa;
+    });
+    const items = all.slice(0, 30);
+    trumpNewsCache = { items, fetchedAt: now };
+    return { ok: true, items, fetchedAt: now, cached: false };
+  } catch (e) {
+    console.error("[electron] fetch-trump-news failed:", e);
+    return { ok: false, error: String(e) };
+  }
+});
+
+// ── IPC: open URL in user's default browser ──────────────────────────
+ipcMain.handle("mk:open-external", async (_event, url) => {
+  try {
+    if (typeof url !== "string" || !/^https?:\/\//.test(url)) {
+      return { ok: false, error: "invalid url" };
+    }
+    await shell.openExternal(url);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+});
+
+// ── v5: IPC — download installer + auto-launch + quit terminal ────────
+// Renderer (UpdateAvailableModal) calls this with the installer URL.
+// We follow redirects (max 5 hops), stream to %TEMP%\mk-trades-update.exe
+// emitting `mk:installer-progress` events to the renderer for the progress
+// UI, then spawn the .exe detached and quit the terminal so NSIS can
+// replace the install directory without file-in-use errors.
+function _httpGet(url, redirectsLeft = 5) {
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try { parsed = new URL(url); } catch (e) { return reject(e); }
+    const lib = parsed.protocol === "https:" ? https : http;
+    const req = lib.get(url, { headers: { "User-Agent": "MK-TRADES-Updater" } }, (res) => {
+      const code = res.statusCode || 0;
+      if ([301, 302, 303, 307, 308].includes(code)) {
+        if (redirectsLeft <= 0) return reject(new Error("too many redirects"));
+        const loc = res.headers.location;
+        res.resume();
+        if (!loc) return reject(new Error("redirect without Location"));
+        const next = loc.startsWith("http") ? loc : new URL(loc, parsed).toString();
+        return _httpGet(next, redirectsLeft - 1).then(resolve, reject);
+      }
+      if (code < 200 || code >= 300) {
+        res.resume();
+        return reject(new Error(`HTTP ${code}`));
+      }
+      resolve(res);
+    });
+    req.on("error", reject);
+    req.setTimeout(120_000, () => { try { req.destroy(new Error("timeout")); } catch {} });
+  });
+}
+
+ipcMain.handle("mk:download-and-install", async (event, url) => {
+  if (typeof url !== "string" || !/^https?:\/\//.test(url)) {
+    return { ok: false, error: "invalid url" };
+  }
+  // Path: %TEMP%\mk-trades-update-<timestamp>.exe (timestamp avoids
+  // file-locked rename-on-rerun scenarios).
+  const fname = `mk-trades-update-${Date.now()}.exe`;
+  const dest  = path.join(os.tmpdir(), fname);
+  try {
+    const res = await _httpGet(url);
+    const total = parseInt(res.headers["content-length"] || "0", 10) || 0;
+    let received = 0;
+    let lastEmit = 0;
+    const out = fs.createWriteStream(dest);
+    await new Promise((resolve, reject) => {
+      res.on("data", (chunk) => {
+        received += chunk.length;
+        const now = Date.now();
+        // Throttle progress events to ~6/s so renderer doesn't get hammered.
+        if (now - lastEmit > 160) {
+          lastEmit = now;
+          try {
+            event.sender.send("mk:installer-progress", {
+              received, total,
+              pct: total > 0 ? received / total : null,
+            });
+          } catch {}
+        }
+      });
+      res.on("error", reject);
+      out.on("error", reject);
+      out.on("finish", resolve);
+      res.pipe(out);
+    });
+    // Final progress emit so the UI can flip to "launching".
+    try {
+      event.sender.send("mk:installer-progress", {
+        received, total: received, pct: 1, done: true,
+      });
+    } catch {}
+
+    // Spawn the installer detached so it survives the terminal quitting.
+    // NSIS handles its own "stop running app" but we quit explicitly so
+    // the install dir is unlocked the moment NSIS reaches the file copy.
+    //
+    // v7: NO /S flag. With electron-builder oneClick:true the installer
+    //   is already near-silent (just a small "Installing…" progress
+    //   window) AND it auto-launches the new exe via .onInstSuccess.
+    //   /S would suppress BOTH the progress window AND the auto-launch,
+    //   leaving the user with no running app after update.
+    //   windowsHide:true is kept to avoid any console flash, but the
+    //   NSIS progress window (a GUI window, not a console) still shows.
+    try {
+      const child = spawn(dest, [], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      child.unref();
+    } catch (e) {
+      return { ok: false, error: `spawn failed: ${String(e)}` };
+    }
+
+    // Tiny delay so the installer process is alive before we quit — avoids
+    // the Windows "starting up" race where a freshly-spawned detached child
+    // can be killed if its parent exits within ~50ms on some configs.
+    setTimeout(() => {
+      try { app.quit(); } catch {}
+    }, 800);
+    return { ok: true, file: dest };
+  } catch (e) {
+    try { fs.unlinkSync(dest); } catch {}
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
+// ── IPC: open a detached child window for a given page ────────────────
+// Renderer (TabContextMenu → preload.openInNewWindow) calls this with a
+// pageId. We validate against the allowlist, spawn a BrowserWindow with
+// parent: mainWindow (so it closes when main closes), and load the same
+// app URL with ?detached=<pageId> so the renderer boots into DetachedShell.
+ipcMain.handle("mk:open-in-new-window", async (_event, payload) => {
+  try {
+    const pageId = payload && payload.pageId;
+    if (!VALID_DETACHED_PAGES.has(pageId)) {
+      return { ok: false, error: `invalid pageId: ${String(pageId)}` };
+    }
+    if (!mainWindow) {
+      return { ok: false, error: "main window not available" };
+    }
+
+    const childIcon = path.join(app.isPackaged ? process.resourcesPath : __dirname, "..", "icon.ico");
+
+    const win = new BrowserWindow({
+      width:  1200,
+      height: 800,
+      minWidth:  640,
+      minHeight: 480,
+      icon: childIcon,
+      backgroundColor: "#000000",
+      parent: mainWindow,
+      autoHideMenuBar: true,
+      show: false,
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration:  false,
+        preload: path.join(__dirname, "preload.js"),
+      },
+    });
+
+    const url = `${BACKEND_URL}/?detached=${encodeURIComponent(pageId)}`;
+    win.loadURL(url);
+    win.once("ready-to-show", () => win.show());
+    win.on("closed", () => detachedWindows.delete(win));
+
+    // v8: external-URL routing (matches main window).
+    win.webContents.setWindowOpenHandler(({ url: u }) => {
+      if (/^https?:\/\//.test(u)) {
+        shell.openExternal(u).catch(err =>
+          console.error("[electron] shell.openExternal failed:", err));
+      }
+      return { action: "deny" };
+    });
+
+    // v8: keyboard shortcuts. Ctrl+= / Ctrl+- / Ctrl+0 zoom (always on);
+    //     F12 devtools (dev mode only). Mirrors main window.
+    win.webContents.on("before-input-event", (event, input) => {
+      if (input.type !== "keyDown") return;
+      if (input.key === "F12" &&
+          (process.env.ELECTRON_DEV === "1" || !app.isPackaged)) {
+        win.webContents.toggleDevTools();
+        return;
+      }
+      if (input.control || input.meta) {
+        const wc = win.webContents;
+        if (input.key === "=" || input.key === "+") {
+          wc.setZoomLevel(Math.min(wc.getZoomLevel() + 0.5, 9));
+          event.preventDefault();
+        } else if (input.key === "-") {
+          wc.setZoomLevel(Math.max(wc.getZoomLevel() - 0.5, -8));
+          event.preventDefault();
+        } else if (input.key === "0") {
+          wc.setZoomLevel(0);
+          event.preventDefault();
+        }
+      }
+    });
+
+    detachedWindows.add(win);
+    console.log(`[electron] spawned detached window: pageId=${pageId} url=${url}`);
+    return { ok: true };
+  } catch (e) {
+    console.error("[electron] open-in-new-window failed:", e);
+    return { ok: false, error: String(e) };
+  }
+});
+
+// Single-instance lock — clicking the icon while running just focuses the window
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
