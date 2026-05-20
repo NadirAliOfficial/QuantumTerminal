@@ -18,6 +18,16 @@ Unlike traditional platforms that rely on lagging indicators (like RSI or MACD),
 
 ---
 
+## 📸 Screenshots
+
+### Trading Interface — XAUUSD with Volatility Bands & Order Management
+![Trading Interface](screenshots/screenshot_1.jpg)
+
+### Volatility Cones — Probability-Based Price Envelopes
+![Volatility Cones](screenshots/screenshot_2.jpg)
+
+---
+
 ## ✨ Core Features (المميزات الأساسية)
 
 ### 1. 🌐 Multi-Provider Live Feeds (ربط مباشر مع الأسواق)
@@ -80,7 +90,7 @@ QuantumTerminal/
 ### Installation
 1. Clone the repository:
    ```bash
-   git clone https://github.com/YourUsername/QuantumTerminal.git
+   git clone https://github.com/wJubran/QuantumTerminal.git
    cd QuantumTerminal/backend
    ```
 2. Install Python dependencies:
