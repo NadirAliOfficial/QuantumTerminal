@@ -183,7 +183,7 @@ def create_account_router(
         """Load debug_config.json — returns defaults if missing."""
         try:
             if _DEBUG_CONFIG_PATH.exists():
-                return json.loads(_DEBUG_CONFIG_PATH.read_text())
+                return json.loads(_DEBUG_CONFIG_PATH.read_text(encoding="utf-8"))
         except Exception:
             pass
         return {"subprocess_debug": False}
