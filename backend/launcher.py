@@ -133,7 +133,7 @@ def open_browser():
         except Exception:
             continue
 
-    webbrowser.open(f"http://127.0.0.1:{PORT}")
+    webbrowser.open(f"http://127.0.0.1:{PORT}", encoding="utf-8")
 
 
 def main():
