@@ -1859,7 +1859,7 @@ async def get_performance_summary(days: int = 90):
         return {"total": 0, "days": days}
 
     try:
-        with open(log_path) as f:
+        with open(log_path, encoding="utf-8") as f:
             all_records = json.load(f)
     except Exception:
         return {"total": 0, "error": "Failed to read log"}
