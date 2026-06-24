@@ -261,7 +261,7 @@ class AccountManager:
         """Load or create settings file."""
         if self._settings_path.exists():
             try:
-                with open(self._settings_path) as f:
+                with open(self._settings_path, encoding="utf-8") as f:
                     data = json.load(f)
                 log.info(f"Loaded trading settings from {self._settings_path}")
                 return TradingSettings.from_dict(data)
@@ -286,7 +286,7 @@ class AccountManager:
         """Load or create state file."""
         if self._state_path.exists():
             try:
-                with open(self._state_path) as f:
+                with open(self._state_path, encoding="utf-8") as f:
                     data = json.load(f)
                 log.info(f"Loaded account state from {self._state_path}")
                 return AccountState.from_dict(data)
