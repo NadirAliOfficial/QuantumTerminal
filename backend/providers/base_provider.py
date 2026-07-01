@@ -35,14 +35,14 @@ from models import (
 class BaseProvider(ABC):
     """
     Abstract provider interface.
-    
+
     Every provider has:
         - A type name (e.g., "mt5", "binance")
         - A unique instance ID (e.g., "mt5_primary", "binance_spot")
         - Connection lifecycle (connect/disconnect/reconnect)
         - Market data methods (ticks, bars, symbol info)
         - Optional execution methods (orders, positions)
-    
+
     Providers are synchronous. The data_server wraps calls in
     asyncio.to_thread() to avoid blocking the event loop.
     """
@@ -126,10 +126,10 @@ class BaseProvider(ABC):
     def get_latest_ticks(self, symbols: List[str]) -> Dict[str, TickData]:
         """
         Fetch latest tick for each symbol.
-        
+
         Args:
             symbols: List of canonical ticker names (e.g., ["XAUUSD", "EURUSD"])
-        
+
         Returns:
             Dict mapping canonical ticker → TickData.
             Missing/failed symbols are simply omitted.
@@ -142,12 +142,12 @@ class BaseProvider(ABC):
     ) -> List[BarData]:
         """
         Fetch recent OHLCV bars for a canonical ticker.
-        
+
         Args:
             ticker: Canonical symbol name
             timeframe: Timeframe string (M1, M5, M15, H1, H4, D1, etc.)
             count: Number of bars to fetch
-        
+
         Returns:
             List of BarData, oldest first. Empty list on failure.
         """
@@ -159,10 +159,10 @@ class BaseProvider(ABC):
     ) -> List[dict]:
         """
         Detect newly closed bars since last check.
-        
+
         Returns list of dicts:
             {"type": "bar", "ticker": str, "timeframe": str, "bar": BarData.to_dict()}
-        
+
         Implementation must track last-seen bar timestamps internally.
         """
         ...
