@@ -626,7 +626,7 @@ def _build_asset_metadata() -> Dict[str, dict]:
     Build asset metadata dict from server_config static data.
     This is the server-side source of truth — replaces the hardcoded
     ASSET_META dict that was duplicated in the frontend.
-    
+
     Returns:
         {
             "XAUUSD": {
@@ -654,14 +654,14 @@ def _build_asset_metadata() -> Dict[str, dict]:
 class ConfigManager:
     """
     Central configuration manager.
-    
+
     Lifecycle:
         1. Load server_config.py defaults (static, versioned)
         2. Load user_config.json if it exists (user overrides, gitignored)
         3. Merge: user config wins where specified
         4. Expose merged config via get_config()
         5. Accept mutations via update() → writes back to user_config.json
-    
+
     Provider management:
         - Creates provider instances from accounts config
         - Tracks which provider is active for data vs execution
@@ -786,7 +786,7 @@ class ConfigManager:
         """
         Return the full merged config dict.
         This is what GET /api/config serves to the frontend.
-        
+
         Shape:
         {
             "version": 1,
@@ -1062,11 +1062,11 @@ class ConfigManager:
         """
         Apply a partial update to user config.
         Deep-merges the patch into existing user config, saves to disk.
-        
+
         Args:
             patch: Partial config dict (same shape as user_config.json)
                    Only specified fields are updated; others preserved.
-        
+
         Returns:
             Updated full config (same as get_config())
         """
@@ -1157,7 +1157,7 @@ class ConfigManager:
         """
         Instantiate and connect all enabled providers from config.
         Called once at server startup.
-        
+
         Returns:
             Dict of provider_id → provider instance
         """
