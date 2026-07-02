@@ -138,7 +138,7 @@ KNOWN_ALIASES: Dict[str, List[str]] = {
 class MT5Provider(BaseProvider):
     """
     MetaTrader 5 data and execution provider.
-    
+
     Config dict keys:
         id:             str  — unique provider instance ID (e.g., "mt5_primary")
         label:          str  — display name (e.g., "MT5 — CFI (Live)")
