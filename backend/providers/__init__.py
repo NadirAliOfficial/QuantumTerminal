@@ -39,7 +39,7 @@ if RITHMIC_AVAILABLE:
 def create_provider(account_config: dict) -> BaseProvider:
     """
     Factory: create a provider instance from account config dict.
-    
+
     Expected config shape:
         {
             "id": "mt5_primary",
@@ -48,7 +48,7 @@ def create_provider(account_config: dict) -> BaseProvider:
             "terminal_path": null,
             "aliases": {}
         }
-    
+
     Raises KeyError if provider type is not registered.
     """
     provider_type = account_config.get("type", "")
@@ -58,7 +58,7 @@ def create_provider(account_config: dict) -> BaseProvider:
             f"Unknown provider type: '{provider_type}'. "
             f"Registered types: {registered}"
         )
-    
+
     cls = PROVIDER_REGISTRY[provider_type]
     return cls(account_config)
 
