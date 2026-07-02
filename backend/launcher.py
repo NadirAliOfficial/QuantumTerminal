@@ -48,7 +48,7 @@ APP_DIR = os.environ.get("MK_APP_DIR_NAME", "QuantumTerminal")
 DEFAULT_CONFIG = f"""\
 [server]
 # No external server needed for Quantum Terminal (open source)
-base_url = 
+base_url =
 
 [data]
 cache_dir = %APPDATA%\\{APP_DIR}\\cache
