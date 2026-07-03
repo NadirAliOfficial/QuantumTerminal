@@ -1045,7 +1045,7 @@ def create_account_router(
                                   f"Walk-forward complete for {canonical} — best_wf_settings.json updated")
                     log.info(f"WF completed for {canonical}")
                 else:
-                    tail = f"See subprocess_logs/wf_{canonical}.log" 
+                    tail = f"See subprocess_logs/wf_{canonical}.log"
                     _wf_jobs[canonical] = {
                         "status": "error",
                         "ticker": canonical,
@@ -1123,7 +1123,7 @@ def create_account_router(
 
                 if proc.returncode != 0:
                     # Read tail of log for error context
-                    tail = f"See subprocess_logs/flow_calibrator_{canonical}.log" 
+                    tail = f"See subprocess_logs/flow_calibrator_{canonical}.log"
                     _flow_jobs[canonical] = {
                         "status": "error", "ticker": canonical,
                         "phase": "calibration_failed",
